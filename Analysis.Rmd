@@ -1,0 +1,2412 @@
+---
+title: "R Notebook"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(exactRankTests)
+library(jsonlite)
+library(RColorBrewer)
+library(thematic)
+library(gghighlight)
+library(ggridges)
+library(extrafont)
+library(ggpubr)
+library(e1071)  
+library(Hmisc)
+library(reshape2)
+library(data.table)
+library(lmPerm)
+library(lazyeval)
+
+extrafont::font_import(prompt=F )
+loadfonts(device="win") 
+fonts()
+set.seed(910401)
+```
+
+
+```{r, theme, include=FALSE}
+GS_scale <- c("#83beeb", "#3b7eb0")
+GT_scale <- c("#F2D16B", "#EBA57A")
+
+accentblue <- "#18233c"
+
+#scale_fill_manual(labels=c("CHOSE PYTHON", "CHOSE R"), values = c("#b07c5c", "#efb795"))
+our_theme <-   theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    text= element_text(family = "Times New Roman", face="bold"),
+    plot.title = element_text(hjust = 0.5, family = "Times New Roman", face="bold"),
+    axis.text= element_text(size=rel(1.1))  
+  )
+theme_set(our_theme)
+
+conditions <- as_tibble(read.csv("wrangled_data/conditions.csv")) %>% mutate(GS=as.factor(GS), GT=as.factor(GT))
+languages <- as_tibble(read.csv("wrangled_data/sessions.csv")) %>% select(participant, language)
+
+clickevents <- as_tibble(read.csv("wrangled_data/clickevents.csv"))
+
+logevents <- as_tibble(read.csv("wrangled_data/logevents.csv")) #each start, end is its own row, i.e. not paired up
+logs <- as_tibble(read.csv("wrangled_data/log_long.csv")) 
+
+
+```
+
+```{r wrappers, include=FALSE}
+
+# Creating a custom summary table
+create.table <- function(df, IV, DV ){
+  res <- df %>% 
+    group_by_( IV )  %>% 
+    summarise_( n = ~n(), 
+                mean = interp( ~mean( v ), v=as.name(DV)),
+                median = interp( ~median( v ), v=as.name(DV)),
+                IQR = interp( ~IQR( v ), v=as.name(DV)),
+                sd = interp( ~sd( v ), v=as.name(DV))
+                )#, median(df[DV]), IQR(df[DV]),  mean(df[DV]), sd(df[DV])) 
+
+  return(res)
+}
+
+create.histogram <- function(df, IV, DV, stat.table, cent.tend, title, xlabl, xlims ){
+  message("Remember to set title, xlab, xlim")
+  IV_scale <- if(IV=="GT"){ GT_scale }else{ GS_scale }
+  labels <- if(IV=="GT"){ c("¬TG", "TG") }else{ c("¬SG", "SG") }
+  
+  newplot <- ggplot(data= df, aes_string(x=DV, group=IV, y="..count..", color=IV)) + 
+            geom_histogram(aes_string(fill=IV), position = "identity",alpha=0.5) + #geom_density(aes(color=GT, fill=GT), alpha=0.5, size=1.5) +
+            scale_fill_manual(labels = labels,values = IV_scale) +
+            scale_color_manual(labels = labels,values = IV_scale) +
+            ylab("Number of participants") + xlab(xlabl) + ggtitle(title) +
+            geom_vline(data = stat.table, aes_string(xintercept = cent.tend, color = IV), size=1, linetype = "dashed") +
+            theme(
+                  legend.position=c(0.9,0.7),
+                  legend.direction="vertical",
+                  legend.justification=c(1, 0),
+          
+                  axis.title.x = element_text(size=14),
+                  axis.title.y = element_text(size=14),
+                  plot.title = element_text(size=16)
+            ) 
+  if(!missing(xlims)){
+    newplot <- newplot + xlim( xlims[1], xlims[2] )
+  }
+  return(newplot)
+}
+
+#df, IV, DV, stat.table, cent.tend, title, xlabl, xlims 
+
+
+
+
+
+analyse_metric <- function(df, DV, cent.tend, title, xlab, xlims ){
+  
+  analysis <- list()
+
+  analysis['shapiro.test'] <- shapiro.test( df[[DV]]  )
+  
+  for(IV in c("GT","GS")){
+    
+    analysis[[IV]] <- list()
+    
+    ## Summary table
+    analysis[[IV]]$median_tbl <- create.table( df, IV, DV )
+    
+    ## Histogram
+    analysis[[IV]]$histogram <- create.histogram(
+        df, 
+        IV, 
+        DV,
+        analysis[[IV]]$median_tbl, 
+        cent.tend, 
+        title, 
+        xlab,
+        xlims
+        )
+    
+    formula <- paste(DV, IV, sep=" ~ ")
+    
+    
+    analysis[[IV]]$t.test <- t.test( as.formula(formula), data=df, conf.int=T )
+    analysis[[IV]]$wilcox.test <- wilcox.test( as.formula(formula), data=df, conf.int=T )
+    analysis[[IV]]$perm.test <- anova( aovp( as.formula(formula), data= df ) )
+    analysis[[IV]]$PS <- ( ( analysis[[IV]]$wilcox.test$W )/ (analysis[[IV]]$median_tbl$n[1] * analysis[[IV]]$median_tbl$n[2]   ))
+    #( 5366 ) / (100*97)
+  }
+  return(analysis)
+}
+
+#analyse_variable(semantic_per_participant, "nr_sem",                  part, title, xlabl, cent.tend, xlims )
+
+```
+
+# Part 1
+
+```{r part1data, cache=TRUE, include=FALSE}
+part1 <- list()
+
+part1$dragdropstates_all <- as_tibble(read.csv("wrangled_data/dragdropstates.csv")) %>% mutate(timestamp = lubridate::as_datetime(timestamp))
+
+part1$opdurations <- as_tibble(read.csv("wrangled_data/opdurations.csv"))  %>% 
+  mutate( startTime = lubridate::as_datetime(startTime), endTime = lubridate::as_datetime(endTime) ) %>%
+  mutate(duration = duration - to_deduct)
+
+part1$qids <- data.frame(qid=c("create1", "create2", "access1", "access2", "calculate1", "calculate2", "combine1","restructure1", "restructure2"), order=1:9)
+
+part1$exercises_all <- as_tibble(read.csv("wrangled_data/part1_exercises.csv")) %>% 
+  mutate( startTime = lubridate::as_datetime(startTime), endTime = lubridate::as_datetime(endTime) ) %>%
+  mutate(duration = duration - to_deduct)
+
+
+```
+
+## Complete Part 1 observations 
+
+```{r, echo=FALSE, include=FALSE}
+
+# Number of distinct qids per person
+# according to drag and drop data
+dragdrop_n <- part1$dragdropstates_all %>%
+  group_by(participant) %>%
+  distinct( participant,qid) %>% 
+  summarise(n=n())
+
+# The participants completing all exercises
+# according to drag and drop data
+part1_complete_cases1 <- dragdrop_n %>%
+  filter(n == max(.$n)) 
+
+# Number of distinct qids per person
+# according to part1exercise data
+part1$exercise_per_participant <- part1$exercises_all %>%
+  group_by(participant) %>%
+  distinct( participant,qid) %>% 
+  summarise(n=n())
+
+# The participants completing all exercises
+# according to part1exercise data
+part1_complete_cases2 <- part1$exercise_per_participant %>% 
+  filter(n== max(.$n))
+
+# Combine the two: everyone who all exercises were saved for, and who also had 
+# drag operations registered for each (just in case)
+part1$complete_cases <- intersect(part1_complete_cases2, part1_complete_cases1) %>% inner_join(conditions )
+```
+
+Out of `r nrow(dragdrop_n)` participants who engaged with at least one exercise, `r nrow(part1$complete_cases)` completed all exercises. Hence the completion rate is `r nrow(part1$complete_cases)/nrow(dragdrop_n) `.
+
+Number of N per cell:
+
+```{r, part1_n_per_cell, include=FALSE,message = FALSE,warning = FALSE}
+
+part1$exercises_per_cell <- part1$exercise_per_participant %>% inner_join(conditions ) %>% group_by(GS,GT) %>% summarise(mean=mean(n),median=median(n))
+
+part1$exercises_per_cell
+```
+
+```{r, part1attrition, echo=FALSE, include=FALSE }
+
+# Dark barplot showing attrition over time
+
+ggplot( part1$exercise_per_participant %>% inner_join(conditions )  %>% mutate(participant = fct_reorder(participant, desc(n)), participant = as.numeric(participant ) ), 
+        aes(x=n, y=participant)) +
+  geom_segment(aes(x=0, xend=n, y=participant, yend=participant ),size=1, alpha=0.7, color="#18233c") +
+  ylab("Number of participants") + xlab("Exercise") +
+  scale_x_continuous(breaks= 0:9) +
+  ggtitle("Part 1 attrition over time") +
+  theme(
+      text= element_text(family = "Times New Roman", face="bold", size=14),
+      plot.title = element_text(hjust = 0.5, family = "Times New Roman", face="bold", size=18),
+      legend.text=element_text(size=14),
+      legend.title = element_blank(),
+      legend.position = c(0.9,0.9))
+
+ggsave("plots/part1_attrition.png", last_plot(), png(), width=10, height=8, units="cm")
+last_plot()
+```
+
+```{r, part1_cellsizes_prepost, include=FALSE,message = FALSE,warning = FALSE}
+
+# Cell sizes out of those who started
+part1_pre <- part1$exercise_per_participant %>% inner_join(conditions ) %>% group_by(GS,GT) %>% summarise(n=n()) %>% mutate(pre_or_post = "pre") %>%
+  mutate(freq = round(  100 *  n / sum(n)))
+
+# Cell sizes out of those who completed
+part1_post <- part1$complete_cases %>% inner_join(conditions ) %>% group_by(GS,GT) %>% summarise(n=n()) %>% mutate(pre_or_post = "post") %>%
+  mutate(freq = round( 100 * n / sum(n)))
+
+# Combining them in long form
+part1$pre_post <- bind_rows(part1_pre, part1_post) 
+```
+
+```{r, part1_prepost_graphic, include=FALSE,message = FALSE,warning = FALSE}
+
+# Cell sizes out of those who started
+part1_pre_GS <- part1$exercise_per_participant %>% inner_join(conditions ) %>% group_by(GS) %>% summarise(n=n()) %>% mutate(pre_or_post = "pre") %>%
+  mutate(freq = round(  100 *  n / sum(n)))
+
+part1_pre_GT <- part1$exercise_per_participant %>% inner_join(conditions ) %>% group_by(GT) %>% summarise(n=n()) %>% mutate(pre_or_post = "pre") %>%
+  mutate(freq = round(  100 *  n / sum(n)))
+
+
+# Cell sizes out of those who completed
+part1_post_GS <- part1$complete_cases %>% inner_join(conditions ) %>% group_by(GS) %>% summarise(n=n()) %>% mutate(pre_or_post = "post") %>%
+  mutate(freq = round( 100 * n / sum(n)))
+
+part1_post_GT <- part1$complete_cases  %>% inner_join(conditions ) %>% group_by(GT) %>% summarise(n=n()) %>% mutate(pre_or_post = "post") %>%
+  mutate(freq = round( 100 * n / sum(n)))
+
+# Combining them in long form
+part1$pre_post_GS <- bind_rows(part1_pre_GS, part1_post_GS) 
+
+part1$pre_post_GT <- bind_rows(part1_pre_GT, part1_post_GT) 
+
+grouping_theme <- our_theme +
+  theme(
+      text= element_text(family = "Times New Roman", face="bold", size=12),
+      plot.title = element_text(hjust = 0.5, family = "Times New Roman", face="bold", size=14),
+      #axis.text.y=element_blank(),
+      #axis.ticks.y=element_blank(),
+      legend.text=element_text(size=12,margin = margin(r=25, unit = "pt")),
+      legend.title = element_blank())  #legend.spacing.x = unit(0.7, "cm") 
+
+GT_grouping <- ggplot( part1$pre_post_GT , aes(y=pre_or_post, x=freq, fill=GT) ) + 
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(labels = c("¬TG", "TG"), values = GT_scale ) +
+  scale_y_discrete("", labels = c("pre" = "Started","post" = "Completed"))  +
+  #ggtitle("Thumbnail graphics balancing") + 
+  xlab("Relative frequency")  + grouping_theme
+  #scale_x_continuous("Percent", breaks=seq(0,100,5))
+
+GS_grouping <- ggplot( part1$pre_post_GS , aes(y=pre_or_post, x=freq, fill=GS) ) + 
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(labels = c("¬SG", "SG"), values = GS_scale ) +
+  scale_y_discrete("", labels = c("pre" = "Started","post" = "Completed"))  +
+  #ggtitle("Subgoal graphics balancing") + 
+  xlab("Relative frequency")   + grouping_theme
+  #scale_x_continuous("Percent", breaks=seq(0,100,5)) 
+
+GSGT_grouping <- ggarrange( GT_grouping, GS_grouping, ncol=1, nrow=2)
+GSGT_grouping <- annotate_figure(GSGT_grouping,
+               top = text_grob("Group balances for thumbnail graphics (TG)\nand subgoal graphics (SG)", face = "bold", size = 18, family="Times New Roman"))
+
+ggsave("plots/GSGT_grouping.png", GSGT_grouping,png(), width=15,height=8,units="cm")
+
+last_plot()
+
+```
+
+## Operation cards
+```{r, include=FALSE,message = FALSE,warning = FALSE}
+
+# Reading in the ontology to reorder factor based on cards' order of occurrence
+part1$opcard_qids <- as_tibble( read.csv("flat_taxonomy.csv") ) %>%
+  mutate(identifier = 1:nrow(.)) %>%
+  mutate(qid = fct_reorder(as.factor(code), identifier))
+
+# Collect reading times for all complete observations
+part1$opdurations_complete_cases <- part1$opdurations %>%  filter( participant %in% part1$complete_cases$participant) 
+
+# Aggregate medians for the purpose of replacing abnormal data with it  
+avg_opdur <-  part1$opdurations %>% 
+  filter(participant %in% part1$complete_cases$participant) %>%
+  group_by(participant) %>% summarise(median_duration = median(duration)) 
+
+# Collect number of abnormal records
+obs_excluded <- part1$opdurations %>% 
+  filter(participant %in% part1$complete_cases$participant, duration < 0 | duration > 200)
+
+# After replacing abnormal data, sum reading times per participant
+part1$opdurations_durations <-  part1$opdurations %>% 
+  filter(participant %in% part1$complete_cases$participant) %>%
+  inner_join(avg_opdur) %>%
+  mutate( duration = ifelse( duration < 0 | duration > 200, median_duration, duration )   ) %>%
+  group_by(participant) %>% summarise(opduration_tot = sum(duration)) %>%
+  inner_join(conditions)
+
+
+obj <- analyse_metric(
+  part1$opdurations_durations,
+  "opduration_tot",
+  "median",
+  "Operation card reading times",
+  "Total reading time (seconds)"
+)
+
+ggsave("plots/opcards.png", obj[['GT']]$histogram, png(), width=12,height=8,units="cm")
+
+```
+
+Among operation card reading time data, `r nrow(obs_excluded)` records out of `r nrow(part1$opdurations_complete_cases)`, which were replaced by participant medians.
+
+The number of people who read all cards
+
+```{r}
+part1$opdurations_by_qid <- part1$opdurations %>% 
+  group_by( participant,code ) %>%
+  summarise(tot = sum(duration))  %>%
+  inner_join(conditions) %>%
+  filter(tot>0, tot<7500) %>% 
+  group_by(code, GT) %>%
+  summarise(median = median(tot)) %>%
+  pivot_wider(id_cols=code, names_from=GT, values_from=median) %>%
+  mutate(diff = False - True, TG_is_smaller=ifelse(diff>0, T,F)) %>%
+  inner_join(part1$opcard_qids, by="code") 
+
+  
+ggplot(part1$opdurations_by_qid , aes(y=diff, x=reorder(code, identifier), fill = TG_is_smaller) ) + 
+  geom_bar(stat="identity" ) + theme_minimal()  + 
+  scale_fill_manual(labels = c("¬TG is faster", "TG is faster"), values = GT_scale ) +
+ # scale_color_manual(labels = c("¬TG", "TG"), values = GT_scale ) + 
+  #geom_smooth(aes(fill=GS, color=GT), method="loess", alpha=0.2, span=0.1, size=1.3) +
+  #scale_linetype_manual(labels = c("SUBGOALS ABSENT", "SUBGOALS PRESENT"), values=c("dashed", "solid")) +
+  #geom_ribbon(data=pilot2.part2.durs.means.GS, aes(y=median,ymin=bottom, ymax=top, fill=GS), color=NA, alpha=0.2) + 
+  #geom_line(data=pilot2.part2.durs.means.GS, aes(x=qid, y=median, color=GS), size=2) +
+  xlab("Exercise") + ylab("Difference in seconds (¬TG - TG)") + ggtitle("Time on task in Part 2") +
+  #ylim(0, 75) +
+  theme(
+    legend.title = element_blank(),
+    legend.position=c(0.2,0.9),legend.direction = 'vertical',
+    text= element_text(family = "Arial", face="bold"),
+    plot.title = element_text(hjust = 0.5, family = "Arial", face="bold"),
+    axis.text= element_text(size=rel(1.1))  ,
+
+    axis.ticks.x=element_blank(),
+    axis.text.x=element_text(angle=45)
+   # axis.text.x=element_blank()
+  )
+
+```
+
+## Inactivity events
+
+```{r, echo=FALSE, include=FALSE}
+## Logs per part 1 participant
+part1$logs_complete_cases <- logs %>%
+  filter( participant %in% part1$complete_cases$participant)
+
+```
+
+```{r, startendtimes, echo=FALSE, include=FALSE}
+
+# Find the time they saw the first card and count this as start time
+part1StarTimes <- part1$opdurations_complete_cases %>%
+  filter(code=='create') %>%
+  mutate(P1startTime = lubridate::as_datetime(startTime)) %>%
+  group_by( participant ) %>%
+  arrange(P1startTime) %>%  
+  slice(1) %>%
+  ungroup() %>%
+  distinct(participant, .keep_all = T) %>%
+  select(participant, P1startTime)
+
+# Find the time they saw the last exercise and count this as end time
+part1endTimes <- part1$exercises_all %>%
+  filter( participant %in% part1$complete_cases$participant) %>%
+  filter(qid == "restructure2") %>%
+  mutate(P1endTime = lubridate::as_datetime(endTime)) %>%
+  group_by( participant ) %>%
+  arrange(desc(P1endTime)) %>%   #from last ti furst
+  slice(1) %>%
+  ungroup() %>%
+  distinct(participant, .keep_all = T) %>%
+  select(participant, P1endTime)
+
+#startTime and endTime for all
+part1$times <- part1StarTimes %>% inner_join(part1endTimes) #%>% rename(startTime = P1startTime, endTime = P1endTime)
+```
+
+
+
+```{r, logs_part1, echo=FALSE, include=FALSE}
+
+# Nr of log event per category, let it be 0 if none
+part1$logs_per_category <- part1$logs_complete_cases %>%
+  inner_join(part1$times) %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels=c("tab","timeout"))) %>%
+  mutate(participant = factor(participant, levels=part1$complete_cases$participant)) %>%
+  filter(startTime > P1startTime, endTime < P1endTime) %>%
+  group_by(participant,category,.drop = F) %>%  #,   
+  summarise(n=n()) 
+  
+
+part1$logs_wide <- part1$logs_per_category %>% pivot_wider(id_cols=participant, names_from = category, values_from = n) %>% 
+  inner_join(conditions) %>%
+  mutate(inactivity = tab + timeout)
+
+
+
+obj <- analyse_metric(
+  part1$logs_wide %>% filter(inactivity >0),
+  "inactivity",
+  "median",
+  "Part 1 number of inactivity events",
+  "Number of inactivity events",
+  c(0,100)
+)
+
+ggsave("plots/part1inactivity_GT.png", obj[["GT"]]$histogram, width=12,height=8,units="cm" )
+ggsave("plots/part1inactivity_GS.png", obj[["GS"]]$histogram, width=12,height=8,units="cm" )
+
+```
+
+
+
+During Part 1, participants engaged in `r median(part1logs_breakdown_wide$tab)`
+
+
+## Menu clicks
+
+
+```{r taxclicks1, echo=FALSE, include=FALSE}
+
+# All part 1 taxonomy clicks
+tax_part1_ex <- clickevents %>% 
+  filter(part == 1, type=='TAXONOMY') 
+
+part1$taxclicks_per_participant  <- tax_part1_ex %>%
+  filter( participant %in% part1$complete_cases$participant) %>%
+  mutate(participant = factor(participant, levels=part1$complete_cases$participant)) %>%
+  #group_by(participant, .drop=FALSE) %>%
+  group_by(participant) %>%
+  summarise(nr_clicks=n()) %>%
+  inner_join(conditions ) 
+
+
+obj <- analyse_metric(
+  part1$taxclicks_per_participant %>% filter(nr_clicks > 0),
+  "nr_clicks",
+  "median",
+  "Part 1 number of thumbnail menu click events",
+  "Number of menu click events",
+  c(0,120)
+)
+ggsave("plots/click_groups1_GT.png", obj[["GT"]]$histogram, width=12,height=8,units="cm" )
+
+
+```
+
+
+## Hover events
+
+
+
+```{r, hoverevents, echo=FALSE, include=FALSE}
+
+hover_part1_ex <- clickevents %>% 
+  filter(part==1, type=='thumbnail-hover') 
+
+part1$hovers_per_participant  <- hover_part1_ex %>%
+  filter( participant %in% part1$complete_cases$participant) %>%
+  mutate(participant = factor(participant, levels=part1$complete_cases$participant)) %>%
+  group_by(participant, .drop=FALSE) %>%
+  summarise(nr_hovers=n()) %>%
+  inner_join(conditions ) 
+
+
+obj <- analyse_metric(
+  part1$hovers_per_participant %>% filter(nr_hovers > 0),
+  "nr_hovers",
+  "median",
+  "Part 1 tooltip events",
+  "Number of tooltip events"
+)
+
+ggsave("plots/hover_groups.png", obj[["GT"]]$histogram, png(), width=12,height=8,units="cm")
+
+```
+
+
+
+
+
+## Incorrect attempts
+
+
+```{r, attempts1, echo=FALSE, include=FALSE}
+
+# Number of incorrect attempts
+part1$attempts_per_participant  <- part1$dragdropstates_all %>%
+  filter( participant %in% part1$complete_cases$participant, correct=="False"   ) %>%
+  group_by( participant) %>%
+  summarise(total_attempts = n()) %>%
+  inner_join(conditions, by="participant")
+
+obj <- analyse_metric(
+  part1$attempts_per_participant,
+  "total_attempts",
+  "median",
+  "Part 1 number of incorrect attempts",
+  "Total number of incorrect attempts",
+  c(0,250)
+)
+
+ggsave("plots/part1performance_GT.png",obj[['GT']]$histogram ,png(), width=12,height=8,units="cm")
+ggsave("plots/part1performance_GS.png",obj[['GS']]$histogram ,png(), width=12,height=8,units="cm")
+```
+
+
+## Time-on-task
+
+
+
+```{r, tot1GT, echo=FALSE, include=FALSE }
+
+
+part1$tot_per_participant <- part1$exercises_all %>%
+  filter( participant %in% part1$complete_cases$participant   ) %>%
+  group_by( participant, qid ) %>%
+  arrange(desc(duration)) %>%  ### If multiple, choose the longest one
+  slice(1) %>%
+  ungroup() %>%
+  group_by(participant) %>%
+  summarise(total_time = sum(duration)) %>%
+  inner_join(conditions, by="participant")  
+
+obj <- analyse_metric(
+  part1$tot_per_participant,
+  "total_time",
+  "median",
+  "Part 1 time on task",
+  "Total time (seconds)"
+)
+
+
+ggsave("plots/part1totaltime_GT.png", obj[['GT']]$histogram, png(), width=12,height=8,units="cm")
+ggsave("plots/part1totaltime_GS.png", obj[['GS']]$histogram, png(), width=12,height=8,units="cm")
+
+
+```
+
+
+
+# Part 3
+
+```{r, cache=TRUE, include=FALSE}
+
+part3 <- list()
+
+part3$qids <- c("vector1", "vector2", "vector3", "vector_test", "matrix1", "matrix2", "matrix3", "matrix4", "matrix5", "matrix_test", "dataframe1", "dataframe2", "dataframe3", "dataframe4", "dataframe5", "dataframe6", "dataframe7", "dataframe_test")
+
+part3$qids_to_include <- part3$qids[1:10] #[!str_detect(part3$qids,"test")]
+
+qids_order <- data.frame(qid=part3$qids, identifier=1:length(part3$qids))
+
+# Read in exercise and programming log data, turn qid into an ordered factor, 
+
+part3$exercises <- as_tibble(read.csv("wrangled_data/part3_exercises.csv")) %>%    
+  inner_join(qids_order, by="qid") %>%
+  mutate(qid = fct_reorder(as.factor(qid), desc(identifier))) %>% select(-c("identifier")) %>%
+  mutate(duration = duration - to_deduct)
+
+part3$progexruns <- as_tibble(read.csv("wrangled_data/progexruns.csv")) %>%    
+  inner_join(qids_order, by="qid") %>%
+  mutate(qid = fct_reorder(as.factor(qid), desc(identifier))) %>% select(-c("identifier")) 
+
+```
+
+
+## Completion rate
+
+**Do people in the GS condition complete more exercises, on average?**
+
+First, a table on the number of people who completed X amount of exercises.
+
+
+```{r, echo=FALSE}
+
+# Number of exercises completed per person
+part3$exercise_per_participant <- part3$exercises %>%
+  distinct( participant,  qid) %>%
+  group_by(participant) %>%
+  summarise(n=n()) %>% inner_join(conditions)
+
+
+obj <- analyse_metric(
+  part3$exercise_per_participant,
+  "n",
+  "median",
+  "Part 3 Completion Rate",
+  "Number of exercises completed",
+  c(0,18)
+)
+ggsave("plots/part1completion_GT.png", obj[['GT']]$histogram + ylim(0,15), png(), width=10,height=7,units="cm")
+ggsave("plots/part1completion_GS.png", obj[['GS']]$histogram + ylim(0,15), png(), width=10,height=7,units="cm")
+
+
+completion_data_GT <- part3$exercise_per_participant %>% filter(n==max(n)) %>% group_by(GT) %>% summarise(n=n())
+
+chisq.test(completion_data_GT$n, p=c(107/204, 97/204))
+
+completion_data_GS <- part3$exercise_per_participant %>% filter(n==max(n)) %>% group_by(GS) %>% summarise(n=n())
+
+chisq.test(completion_data_GS$n, p=c(103/204, 101/204))
+```
+
+
+### Attrition
+
+```{r, part3attrition}
+
+### Number of people who completed all exercises
+part3$exercises_complete_18 <- part3$exercises %>%    
+  distinct( participant,qid) %>%
+  group_by(participant) %>%
+  summarise(n=n()) %>% 
+  filter(n == max(.$n)) %>%
+  inner_join(conditions)
+
+### Completion data for non-test exercises
+part3$exercises_complete_10 <- part3$exercises %>%    ### Select the longest instead?
+  #filter( qid %in% part3$qids_to_include ) %>% 
+  distinct( participant,qid) %>%
+  group_by(participant) %>%
+  summarise(n=n()) %>% inner_join(conditions) 
+
+### Number who completed at least all nontest
+part3$complete_cases <- part3$exercises_complete_10 %>% filter(n > 9 ) 
+
+```
+
+
+```{r}
+
+ggplot( part3$exercises  %>%    
+  distinct( participant,qid) %>%
+  group_by(participant) %>%
+  summarise(n=n()) %>% 
+  mutate(participant = fct_reorder(participant, desc(n)), participant = as.numeric(participant ) ), 
+        aes(x=n, y=participant)) +
+  geom_segment(aes(x=0, xend=n, y=participant, yend=participant ),size=1, fill=accentblue, color=accentblue) +
+  #scale_color_manual(labels = c("¬SG", "SG"), values = GT_scale ) +
+  ylab("Number of participants") + xlab("Exercise") +
+  ggtitle("Part 3 attrition over time") +
+  scale_x_continuous(breaks= 0:18) +
+  #geom_vline(xintercept = 10) + annotate("text", x=10, y = 120, label="Cut-off point for\n data omission", family="Arial", size=4) +
+  theme(
+      text= element_text(family = "Times New Roman", face="bold", size=14),
+      plot.title = element_text(hjust = 0.5, family = "Times New Roman", face="bold", size=16),
+      #axis.text.y=element_blank(),
+      #axis.ticks.y=element_blank(),
+      legend.text=element_text(size=14),
+      legend.title = element_blank(),
+      legend.position = c(0.9,0.9))
+
+ggsave("plots/part3_attrition.png",last_plot(),png(), width=12,height=8,units="cm")
+
+
+
+```
+
+
+When we look into those who complete all 18 exercises in Part 3, i.e. the maximum, we find the following ratio:
+In other words, `r round((100*34)/56,2)` are in the graphical subgoal group, which seems like an over-representation (should I use Chi2 to check the ratio?).
+For the rest of the analysis, I only include people who complete all 18 exercises. Mysteriously, this leaves only 56 cases for reasons I have yet to figure out. Previously I have based estimates on the number of Part 3 evaluations submitted, but it is possible there may have been duplicates in it somehow... Anyhow, given that many are close to 18, it seems like imputation could be a wise move.
+
+```{r}
+
+
+# Cell sizes out of those who started
+part3_pre_GS <- part3$exercise_per_participant %>% inner_join(conditions ) %>% group_by(GS) %>% summarise(n=n()) %>% mutate(pre_or_post = "pre") %>%
+  mutate(freq = round(  100 *  n / sum(n)))
+
+part3_pre_GT <- part3$exercise_per_participant %>% inner_join(conditions ) %>% group_by(GT) %>% summarise(n=n()) %>% mutate(pre_or_post = "pre") %>%
+  mutate(freq = round(  100 *  n / sum(n)))
+
+
+# Cell sizes out of those who completed
+part3_post_GS <- part3$exercises_complete_18 %>% inner_join(conditions ) %>% group_by(GS) %>% summarise(n=n()) %>% mutate(pre_or_post = "post") %>%
+  mutate(freq = round( 100 * n / sum(n)))
+
+part3_post_GT <- part3$exercises_complete_18 %>% inner_join(conditions ) %>% group_by(GT) %>% summarise(n=n()) %>% mutate(pre_or_post = "post") %>%
+  mutate(freq = round( 100 * n / sum(n)))
+
+# Combining them in long form
+part3$pre_post_GS <- bind_rows(part3_pre_GS, part3_post_GS) 
+
+part3$pre_post_GT <- bind_rows(part3_pre_GT, part3_post_GT) 
+
+grouping_theme <- our_theme +
+  theme(
+      text= element_text(family = "Times New Roman", face="bold", size=12),
+      plot.title = element_text(hjust = 0.5, family = "Times New Roman", face="bold", size=14),
+      #axis.text.y=element_blank(),
+      #axis.ticks.y=element_blank(),
+      legend.text=element_text(size=12,margin = margin(r=25, unit = "pt")),
+      legend.title = element_blank())  #legend.spacing.x = unit(0.7, "cm") 
+
+GT_grouping3 <- ggplot( part3$pre_post_GT , aes(y=pre_or_post, x=freq, fill=GT) ) + 
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(labels = c("¬TG", "TG"), values = GT_scale ) +
+  scale_y_discrete("", labels = c("pre" = "Started","post" = "Completed"))  +
+  grouping_theme +
+  theme(
+    legend.position="top"
+  ) +
+  xlab("Relative frequency")  + 
+  ggtitle("Group balances for thumbnail graphics")
+  #scale_x_continuous("Percent", breaks=seq(0,100,5))
+
+ggsave("plots/GT_grouping3.png", GT_grouping3,png(), width=10,height=5,units="cm")
+
+GS_grouping3 <- ggplot( part3$pre_post_GS , aes(y=pre_or_post, x=freq, fill=GS) ) + 
+  geom_bar(position="fill", stat="identity") + 
+  scale_fill_manual(labels = c("¬SG", "SG"), values = GS_scale ) +
+  scale_y_discrete("", labels = c("pre" = "Started","post" = "Completed"))  +
+  grouping_theme +
+  theme(
+    legend.position="top"
+  ) +
+  xlab("Relative frequency")  +
+  ggtitle("Group balances for subgoal graphics")
+  #scale_x_continuous("Percent", breaks=seq(0,100,5)) 
+
+#GSGT_grouping3 <- ggarrange( GT_grouping3, GS_grouping3, ncol=1, nrow=2)
+#GSGT_grouping3 <- annotate_figure(GSGT_grouping3,
+#               top = text_grob("Group balances for thumbnail graphics (TG)\nand subgoal graphics (SG)", face = "bold", #size = 18, family="Times New Roman"))
+
+ggsave("plots/GS_grouping3.png", GS_grouping3,png(), width=10,height=5,units="cm")
+
+
+```
+
+
+## Time on task
+
+Time on task is operationalised as the total time for all exercises.
+
+
+```{r, echo=FALSE}
+
+part3$tot_per_participant <- part3$exercises %>% #filter(!str_detect(qid, "test")) %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  filter( qid %in% part3$qids_to_include ) %>%
+  group_by( participant, qid ) %>%  
+  arrange(desc(duration)) %>%   #Take the longest
+  slice() %>%
+  ungroup() %>%
+  group_by( participant ) %>%
+  summarise(total_time = sum(duration)) %>%
+  inner_join(conditions, by="participant") #%>%  filter(total_time < 30000)    #Very important issue
+
+
+obj <- analyse_metric(
+  part3$tot_per_participant,
+  "total_time",
+  "median",
+  "Part 3 time on task",
+  "Total time (seconds)",
+  c(0, 15000)
+)
+
+ggsave("plots/part3totaltime_GT.png", obj[['GT']]$histogram, png(), width=12,height=8,units="cm")
+ggsave("plots/part3totaltime_GS.png", obj[['GS']]$histogram, png(), width=12,height=8,units="cm")
+
+```
+
+
+```{r, echo=FALSE}
+# Per exercise
+part3$exercises %>%
+  filter( qid %in% part3$qids ) %>%
+  group_by( participant, qid ) %>%
+  summarise(total_time = sum(duration)) %>%
+  inner_join( conditions, by = "participant" ) %>%
+  filter(total_time < 10000) %>%
+  ggplot(aes(x=reorder(qid, desc(qid)), y=total_time, group=GS, color=GS)) + geom_point(alpha=0.3) + geom_smooth() + ylim(0,2500)
+```
+
+## Syntax errors
+
+Performance is operationalised as the number of attempts across all exercises.
+
+```{r errors, echo=FALSE}
+
+part3$errors_per_participant <- part3$progexruns %>%
+    filter( participant %in% part3$complete_cases$participant   ) %>%
+  mutate(participant = as.factor(participant)) %>%
+  filter( qid %in% part3$qids_to_include ) %>% #distinct(participant)
+  mutate(type = as.factor(type)) %>%
+  filter( str_detect(type, 'error') ) %>%
+  #filter(  type != "script-output", type != "code-completion") %>%  #To avoid double-counting
+  group_by( participant, .drop=F ) %>%
+  summarise(nr_errors=n()) %>%
+  inner_join( conditions, by = "participant" )
+
+
+obj <- analyse_metric(
+  part3$errors_per_participant,
+  "nr_errors",
+  "median",
+  "Part 3 number of syntax errors",
+  "Total number of syntax errors",
+  c(0, 150)
+)
+
+
+ggsave("plots/part3errors_GT.png", obj[['GT']]$histogram, png(), width=12,height=8,units="cm")
+
+ggsave("plots/part3errors_GS.png", obj[['GS']]$histogram, png(), width=12,height=8,units="cm")
+
+```
+
+## Semantic errors
+
+
+
+```{r semantic, echo=FALSE}
+
+part3$semantic_per_participant <- part3$progexruns %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  mutate(participant = as.factor(participant)) %>%
+  filter( qid %in% part3$qids_to_include ) %>% #distinct(participant)
+  mutate(type = as.factor(type)) %>%
+  filter( (type %in% c('output','result','sct'))) %>%
+  #filter(  type != "script-output", type != "code-completion") %>%  #To avoid double-counting
+  group_by( participant, .drop=F ) %>%
+  summarise(nr_sem=n()) %>%
+  inner_join( conditions, by = "participant" )
+
+
+obj <- analyse_metric(
+  part3$semantic_per_participant ,
+  "nr_sem",
+  "median",
+  "Part 3 number of semantic errors",
+  "Total number of semantic errors",
+  c(0, 260)
+)
+
+ggsave("plots/part3sem_GT.png", objs[['GT']]$histogram, png(), width=12,height=8,units="cm")
+ggsave("plots/part3sem_GS.png", objs[['GS']]$histogram, png(), width=12,height=8,units="cm")
+
+
+```
+
+## Overall errors
+
+```{r}
+### Any error, be it semantic or syntactic
+part3$anyerror_per_participant <- part3$progexruns %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  mutate(participant = as.factor(participant)) %>%
+  filter( qid %in% part3$qids_to_include ) %>% #distinct(participant)
+  mutate(type = as.factor(type)) %>%
+  filter(  type != "script-output", type != "code-completion") %>%  #To avoid double-counting
+  group_by( participant, .drop=F ) %>%
+  summarise(nr_sem=n()) %>%
+  inner_join( conditions, by = "participant" )
+
+obj <- analyse_metric(
+  part3$anyerror_per_participant,
+  "nr_sem",
+  "median",
+  "Part 3 incorrect attempts",
+  "Total number of incorrect errors",
+  c(0, 400)
+)
+
+ggsave("plots/part3attempts_GT.png", obj[['GT']]$histogram, png(), width=17,height=6,units="cm")
+
+ggsave("plots/part3attempts_GS.png", obj[['GS']]$histogram, png(), width=12,height=8,units="cm")
+
+ 
+#perm_plot <- ggarrange(part1perfGTplot, part3perfGTplot, ncol=2, align = "hv") %>% annotate_figure( 
+#               top = text_grob("Number of incorrect attempts", face = "bold", family="Times New Roman", size = 12))
+
+```
+
+
+```{r, echo=FALSE}
+# Number errors per exercise
+progexruns %>%
+  filter( qid %in% part3_qids ) %>%
+  group_by( participant, qid ) %>%
+  summarise(nr_attempts=n()) %>%
+  inner_join( conditions, by = "participant" ) %>%
+  ggplot(aes(x=reorder(qid, desc(qid)), y=nr_attempts, group=GS, color=GS)) + geom_point(alpha=0.3) + geom_smooth()
+```
+
+## Hints
+
+```{r}
+part3$hintdata <- clickevents %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>% #distinct(participant)
+  mutate(participant = factor(participant, levels=part3$complete_cases$participant)) %>%  
+  filter( qid %in% part3$qids_to_include ) %>% #distinct(participant)
+  filter(part==3, type=="HINT") %>%
+  group_by( participant) %>%
+  summarise(nr_hints=n()) %>%
+  inner_join( conditions, by = "participant" )
+
+obj <- analyse_metric(
+  part3$hintdata,
+  "nr_hints",
+  "median",
+  "Part 3 number of hints used",
+  "Total number of hints used"
+)
+
+ggsave("plots/part3hints_GT.png", obj[['GT']]$histogram,png(), width=12,height=8, units="cm")
+ggsave("plots/part3hints_GS.png", obj[['GS']]$histogram,png(), width=12,height=8, units="cm")
+
+
+```
+
+## Tooltip events
+
+```{r, hoverevents3}
+
+hover_part1_ex3 <- clickevents %>% 
+  filter(part==3, type=='thumbnail-hover') 
+
+part3$hover_per_participant <- hover_part1_ex3 %>%
+  mutate(participant = factor(participant, levels=part3$complete_cases$participant)) %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  filter( qid %in% part3$qids_to_include ) %>%
+  group_by(participant) %>%
+  #group_by(participant, .drop=FALSE) %>%
+  summarise(nr_hovers=n()) %>%
+  inner_join(conditions ) 
+
+
+obj <- analyse_metric(
+  part3$hover_per_participant %>% filter(nr_hovers > 0) ,
+  "nr_hovers",
+  "median",
+  "Part 3 tooltip events",
+  "Total number of tooltip events",
+  c(0,30)
+)
+
+ggsave("plots/hover_groups3GT.png", obj[['GT']]$histogram, png(), width=12, height=8, units="cm")
+ggsave("plots/hover_groups3GS.png", obj[['GS']]$histogram, png(), width=12, height=8, units="cm")
+
+
+```
+
+## Menu clicks
+
+```{r}
+
+tax_part1_ex3 <- clickevents %>% 
+  filter(part == 3, type %in% c('TAXONOMY'))   #,'DOCUMENTATION'
+
+part3$taxclicks_per_participant <- tax_part1_ex3 %>%
+  mutate(participant = factor(participant, levels=part3$complete_cases$participant)) %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  filter( qid %in% part3$qids_to_include ) %>%
+  group_by(participant) %>%               #, .drop=F
+  summarise(nr_clicks=n()) %>%
+  inner_join(conditions ) 
+
+
+obj <- analyse_metric(
+  part3$taxclicks_per_participant,
+  "nr_clicks",
+  "median",
+  "Part 3 menu clicks",
+  "Total number of menu clicks"
+)
+
+ggsave("plots/click_groups3.png", obj[['GT']]$histogram, png(), width=12,height=8,units="cm")
+
+
+```
+
+```{r}
+
+taxtabs <- part3$taxclicks_per_participant_withzero %>% 
+  inner_join(part3$logs_per_category_participant %>% filter(category=="tab") %>% 
+               select(-category) %>% rename(nr_tabs=n), by="participant") %>%
+  inner_join(
+    
+    clickevents %>% 
+  filter(part == 3, type =='HINT') %>%
+    mutate( which = str_sub(data, 6,6)  ) %>% 
+    filter(which %in% c("0","2")) %>%
+    group_by(participant) %>%
+    summarise(nr_hint1 = n()),
+  by="participant"
+  )
+
+
+hintsplot <- ggplot(taxtabs, aes(x=nr_clicks, y=nr_hint1)) + geom_point(size=3, alpha=0.5) +
+  ggtitle("Hint usage and menu clicks") + xlab("Number of menu clicks") + ylab("Number of hints") +
+  theme(
+    plot.title = element_text(size=22),
+    axis.title = element_text(size=20),
+    axis.text = element_text(size=16)
+  )
+
+tabplot <- ggplot(taxtabs, aes(x=nr_clicks, y=nr_tabs)) + geom_point(size=3, alpha=0.5) +
+  ggtitle("Tab changes and menu clicks") + xlab("Number of menu clicks") + ylab("Number of tab changes")  +
+  theme(
+    plot.title = element_text(size=22),
+    axis.title = element_text(size=20),
+    axis.text = element_text(size=16)
+  )
+
+
+whyfew <- ggarrange(hintsplot, tabplot, ncol=2)
+
+ggsave("plots/why_few_clicks.png", whyfew, width=12, height=6)
+
+```
+
+## Inactivity events
+
+```{r, echo=FALSE, include=FALSE}
+## Logs per part 1 participant
+part3$logs <- logs %>%
+  filter( participant %in% part3$complete_cases$participant)
+
+```
+
+```{r, startendtimes3, echo=FALSE, include=FALSE}
+# Find the time they saw the first card and count this as end time
+part3StarTimes <- part3$exercises %>% inner_join(part3$progexruns, by=c("qid","participant")) %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  filter( qid == "vector1" ) %>% #distinct(participant)
+  mutate(P3startTime = lubridate::as_datetime(startTime)) %>%
+  group_by( participant ) %>%
+  arrange(P3startTime) %>%  
+  slice(1) %>%
+  ungroup() %>%
+  #distinct(participant, .keep_all = T) %>%
+  select(participant, P3startTime)
+
+part3endTimes <- part3$exercises %>% inner_join(part3$progexruns, by=c("qid","participant")) %>%
+  filter( participant %in% part3$complete_cases$participant   ) %>%
+  filter( qid == "dataframe2" ) %>% #distinct(participant)
+  mutate(P3endTime = lubridate::as_datetime(endTime)) %>%
+  group_by( participant ) %>%
+  arrange(desc(P3endTime)) %>%  
+  slice(1) %>%
+  ungroup() %>%
+  #distinct(participant, .keep_all = T) %>%
+  select(participant, P3endTime)
+
+part3$times <- part3StarTimes %>% inner_join(part3endTimes) %>% mutate(duration3 =P3endTime - P3startTime )
+```
+
+```{r, logs_part3, echo=FALSE, include=FALSE}
+
+part3$logs_per_category_participant <- part3$logs %>%
+  inner_join(part3$times) %>%
+  filter(!is.na(category)) %>%
+  mutate(category = factor(category, levels=c("tab","timeout"))) %>%
+  mutate(participant = factor(participant, levels=part3$complete_cases$participant)) %>%
+  filter(startTime > P3startTime, endTime < P3endTime) %>%
+  group_by(participant,category,.drop = F) %>%  #,   
+  summarise(n=n()) 
+  
+
+part3$logs_wide <- part3$logs_per_category_participant %>%  
+  pivot_wider(id_cols=participant, names_from = category, values_from = n)  #%>% mutate
+
+## Combine with conditions
+part3$logs_long <- part3$logs_per_category_participant %>% 
+  inner_join(conditions) 
+
+part3$logs_GT_medians <- part3$logs_long %>%
+  group_by(GT, category) %>% 
+  summarise(nn = n(), median = median(n), lowerQuartile=quantile(n,0.25), higherQuartile=quantile(n,0.75), IQR=IQR(n))
+
+part3$logs_GS_medians <- part3$logs_long %>%
+  group_by(GS, category) %>% 
+  summarise(nn = n(), median = median(n), lowerQuartile=quantile(n,0.25), higherQuartile=quantile(n,0.75), IQR=IQR(n))
+
+```
+
+```{r activityplot3, echo=FALSE, include=FALSE}
+# Creating labeller
+
+log.labs <- c("Tab changes", "Timeouts (>1s)")
+names(log.labs) <-  c("tab", "timeout")
+
+logGTplot3 <- ggplot(part3$logs_long,
+       aes(x=n, color=GT)) + 
+  facet_grid(. ~ category, labeller = labeller(category=log.labs)) +
+  geom_histogram(aes(fill=GT), position = "identity",alpha=0.3) + 
+  #ggtitle("Part 1 number of inactivity events") +
+  scale_fill_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_color_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  xlab("Number of events recorded") + ylab("Number of participants") +
+  geom_vline(data = part3$logs_GT_medians, aes(xintercept = median, color = GT), size=1, linetype = "dashed") +
+  theme(
+        legend.position=c(0.9,0.7),
+        legend.direction="vertical",
+        legend.justification=c(1, 0),
+
+        axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        plot.title = element_text(size=16)
+  )
+
+ggsave("plots/inactivity3_GT.png",last_plot() ,png(), width=12,height=8,units="cm" )  
+
+
+logGSplot3 <- ggplot(part3$logs_long,
+       aes(x=n, color=GS)) + 
+  facet_grid(. ~ category, labeller = labeller(category=log.labs)) +
+  geom_histogram(aes(fill=GS), position = "identity",alpha=0.3) + 
+  ggtitle("Part 3 number of inactivity events") +
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  xlab("Number of events recorded") + ylab("Number of participants") +
+  geom_vline(data = part3$logs_GS_medians, aes(xintercept = median, color = GS), size=1, linetype = "dashed") +
+  theme(
+        legend.position=c(0.9,0.7),
+        legend.direction="vertical",
+        legend.justification=c(1, 0),
+
+        axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        plot.title = element_text(size=16)
+  )
+
+ggsave("plots/inactivity3_GS.png",last_plot() ,png(), width=12,height=8,units="cm" )
+  
+#, align = "hv"
+
+#logplot3 <- ggarrange(logGSplot3, logGTplot3, nrow=2)
+
+#logplot <- annotate_figure(logplot, top = text_grob("Perceived Helpfulness of Subgoal Graphics", face = "bold", size = 10))
+
+
+
+```
+
+```{r}
+tabGSplot3 <- ggplot(part3$logs_wide %>% inner_join(conditions) %>% filter(tab>=0),
+       aes(x=tab, color=GS)) + 
+  geom_histogram(aes(fill=GS), position = "identity",alpha=0.5) + 
+  ggtitle("Part 3 number of tab events") +
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  xlab("Number of tab events") + 
+  ylab("Number of participants") +
+  geom_vline(data = part1$logs_GS_medians_tab, aes(xintercept = median, color = GS), size=1, linetype = "dashed") +
+  theme(
+        legend.position=c(0.9,0.7),
+        legend.direction="vertical",
+        legend.justification=c(1, 0),
+
+        axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        plot.title = element_text(size=16)
+  ) # + ylim(0,10)
+
+ggsave("plots/tabGSPart3.png",tabGSplot3,png(), width=12,height=8,units="cm" )
+
+#
+timeoutGSplot3 <- ggplot(part3$logs_wide %>% inner_join(conditions) %>% filter(timeout>=0),
+       aes(x=timeout, color=GS)) + 
+  geom_histogram(aes(fill=GS), position = "identity",alpha=0.5) + 
+  ggtitle("Part 3 number of timeout events") +
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  xlab("Number of timeout events") + 
+  ylab("Number of participants") +
+  geom_vline(data = part1$logs_GS_medians_timeout, aes(xintercept = median, color = GS), size=1, linetype = "dashed") +
+  theme(
+        legend.position=c(0.9,0.7),
+        legend.direction="vertical",
+        legend.justification=c(1, 0),
+
+        axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        plot.title = element_text(size=16)
+  ) #+ ylim(0,10)
+
+ggsave("plots/timeoutGSPart3.png",timeoutGSplot3,png(), width=12,height=8,units="cm" )
+
+
+```
+
+
+```{r}
+tab_click <- part3logs_breakdown_wide %>%
+  inner_join(tax_part3_participant_withzero) %>%
+  inner_join(hintdata)
+  
+  
+  
+ggplot(tab_click, aes(x=nr_clicks, y=tab)) + geom_point(size=3, alpha=0.5)
+
+```
+
+
+
+
+
+
+## Performance in unscaffolded exercises
+
+```{r}
+### TO DO!!!!
+
+## 1. Merge progexruns with progexercises (only for test exercises)
+## 2. Only take submissions for the first 10 minutes
+## 3. Sort by timestamp
+## 4. 
+
+firstSubmission <- part3$progexruns %>%
+  mutate(timestamp = lubridate::as_datetime(timestamp)) %>%
+  group_by(participant, qid) %>%
+  summarise(startTime = min(timestamp), endTime=max(timestamp))
+
+#  inner_join(part3_exercises %>% 
+#               group_by(participant,qid) %>% 
+#               arrange(desc(duration)) %>%
+#              slice(1) %>%
+#              ungroup(), by=c("participant","qid")) %>%
+
+merged_test <- part3$progexruns %>% 
+  inner_join( firstSubmission, by=c("participant","qid") ) %>%
+  filter( str_detect(qid, "test")) %>%
+  filter( participant %in% part3$exercises_complete_18$participant   ) %>%
+  select( participant, qid, input, output, type, timestamp, startTime ) %>%
+  mutate( diff = lubridate::as_datetime(timestamp) - startTime ) %>%
+  filter( diff < 60*10 )
+
+qid <- c("vector_test","vector_test","vector_test","matrix_test","matrix_test","matrix_test","dataframe_test","dataframe_test","dataframe_test","dataframe_test")
+subgoal_keyword <- c("combined", "sorted", "answer", "odd", "odd_means", "answer", "9000", "merge", "density", "answer")
+subgoal_ix <- c(1,2,3,1,2,3,1,2,3,4)
+subg_key <- data.frame(qid, subgoal_keyword, subgoal_ix)
+
+test_scts <- merged_test %>%
+  full_join(subg_key, by="qid") %>%
+  mutate( keyword_found = ifelse(  str_detect(input, subgoal_keyword ),1,0) ) %>%
+  group_by(participant,qid,subgoal_keyword) %>%
+  summarise(found = max(keyword_found)) %>%
+  ungroup() %>%
+  group_by(participant,qid) %>%
+  summarise(points = sum(found)) %>%
+  ungroup() %>%
+  group_by(participant) %>%
+  summarise(total = sum(points)) %>% inner_join(conditions)
+
+medians.part3.unscaf <- test_scts %>% group_by(GS) %>% summarise(n = n(), median = median(total), lowerQuartile=quantile(total,0.25), higherQuartile=quantile(total,0.75), IQR=IQR(total))
+
+
+ggplot(data=test_scts,aes(x=total, group=GS)) +  #, y=..density..
+  geom_histogram(aes(fill=GS), position = "identity",alpha=0.7, bins=9, color=GS_scale[2]) + #geom_density(aes(color=GS, fill=GS), alpha=0.5, size=1.5) +
+  ggtitle("Part 3 unscaffolded exercises") +
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_x_continuous( limits = c(0,11), breaks = 0:10, minor_breaks = NULL) +
+  xlab("Number of subgoals solved in 10 minutes\n(across three test exercises)") + ylab("Number of participants") +
+  geom_vline(data = medians.part3.unscaf, aes(xintercept = median, color = GS), size=1, linetype = "dashed") +
+  theme(
+        legend.position=c(0.2,0.7),
+        legend.direction="vertical",
+        legend.justification=c(1, 0),
+
+        axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        plot.title = element_text(size=16)
+  )
+
+ggsave("plots/part3progress.png",last_plot(),png(), width=12,height=8,units="cm")
+
+wilcox.test(total ~ GS, data=test_scts)
+
+```
+
+
+
+
+
+
+
+
+# Evaluation data
+
+```{r}
+evals <- as_tibble(read.csv("wrangled_data/evaluations.csv")) %>%  inner_join(conditions, by="participant") 
+
+evaltheme <- our_theme +
+  theme(
+    legend.title = element_blank(),
+    text= element_text(family = "Times New Roman", face="bold"),
+    plot.title = element_text(size=12, hjust = 0.5, family = "Times New Roman", face="bold"),
+    axis.title.y= element_text(size=8),
+    axis.title.x= element_text(size=10)
+  )
+```
+
+## Open-ended feedback
+```{r}
+View( evals %>% filter(part==1, other!="") %>% select(GT, GS, other) )
+```
+
+## Subgoal graphics
+```{r}
+### CURRENTLY IT IS NOT LIMITED TO PEOPLE WHO COMPLETED PART 3!!!!
+#, color=GS_scale[2]
+
+part1_sg_eval <- ggplot(evals %>% filter(part==1), aes(x=subgoalGraphics)) + 
+  geom_bar(width=1, fill=GS_scale[2] ) + ggtitle("Subgoal graphics") +
+  xlab("Perceived helpfulness") + ylab("Number of responses") + scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL)  +
+  theme(plot.title = element_text(size=10)) + evaltheme
+
+ggsave("plots/part1_sg_eval.png", part1_sg_eval, png(), width=5,height=4,units="cm")
+#ggsave("plots/part1_sg_eval.png",last_plot(),png(), width=10,height=7,units="cm")
+
+part3_sg_eval <- ggplot(evals %>% filter(part==3,participant %in% part3$exercises_complete_18$participant), aes(x=subgoalGraphics))  + 
+  geom_bar(width=1, color=GS_scale[2], fill=GS_scale[2] ) + 
+  ggtitle("Subgoal graphics") +
+  xlab("Perceived helpfulness") + ylab("Number of responses") +scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) +
+  theme(plot.title = element_text(size=10)) + evaltheme
+
+ggsave("plots/part3_sg_eval.png", part3_sg_eval, png(), width=5,height=4,units="cm")
+
+#part_sg_eval <- ggarrange(part1_sg_eval, part3_sg_eval, ncol=2, align = "hv")
+#part_sg_eval <- annotate_figure(part_sg_eval,
+#               top = text_grob("Perceived Helpfulness of Subgoal Graphics", face = "bold", family="Times New Roman", size = 12))
+
+ggsave("plots/part_sg_eval.png", part_sg_eval, png(), width=10,height=4,units="cm")
+
+
+#evals %>% filter(part==3) %>% select(subgoalGraphics) %>% group_by(subgoalGraphics) %>% summarise(n=n())
+
+#, !is.na(subgoalGraphics), participant %in% part3$exercises_complete_18$participant)
+
+
+```
+
+
+## Thumbnail graphics
+
+```{r}
+
+
+part1_tg_eval <- ggplot(evals %>% filter(part==1) , aes(x=thumbnailGraphics, color=GT, fill=GT )) + 
+  geom_bar(width=0.8, position = position_dodge2() ) + ggtitle("Thumbnail graphics") +
+  scale_fill_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_color_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  xlab("Perceived helpfulness") + ylab("Number of responses") + scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) + evaltheme  +
+  theme(
+    plot.title = element_text(size=10),
+    legend.key.size = unit(5, 'mm'),
+    legend.text = element_text(size = 8),
+    legend.position = c(0.1, 0.9)
+  ) 
+
+ggsave("plots/part1_tg_eval.png", part1_tg_eval, png(), width=5,height=4,units="cm")
+
+#ggsave("plots/part1_sg_eval.png",last_plot(),png(), width=10,height=7,units="cm")
+
+part3_tg_eval <- ggplot(evals %>% filter(part==3), aes(x=thumbnailGraphics, color=GT, fill=GT))  + 
+  geom_bar(width=0.8, position = position_dodge() ) + 
+  ggtitle("Thumbnail graphics") +
+  scale_fill_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_color_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  xlab("Perceived helpfulness") + ylab("Number of responses") +scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) + evaltheme +
+  theme(
+    plot.title = element_text(size=10),
+    legend.key.size = unit(5, 'mm'),
+    legend.text = element_text(size = 8),
+    legend.position = c(0.1, 0.9)
+  ) 
+
+ggsave("plots/part3_tg_eval.png", part3_tg_eval, png(), width=5,height=4,units="cm")
+
+part_tg_eval <- ggarrange(part1_tg_eval, part3_tg_eval, ncol=2, align = "hv")
+part_tg_eval <- annotate_figure(part_tg_eval,
+               top = text_grob("Perceived Helpfulness of Thumbnails and Tooltips", face = "bold", family="Times New Roman", size = 12))
+
+ggsave("plots/part_tg_eval.png",part_tg_eval,png(), width=16,height=6,units="cm")
+
+```
+
+## Subgoals
+```{r}
+
+part1_s_eval <- ggplot(evals %>% filter(part==1), aes(x=subgoals, fill=GS)) + 
+  geom_bar(width=1, position = position_dodge2(), color=GS_scale[2] ) + ggtitle("Subgoals") +
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  #scale_color_manual(labels = c("ABSENT", "PRESENT"),values =GS_scale) +
+  xlab("Perceived helpfulness") + ylab("Number of responses") + scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) + evaltheme +
+  theme(
+        legend.position = c(0.15,0.9)
+    ) 
+ggsave("plots/part1_s_eval.png", part1_s_eval, png(), width=5,height=4,units="cm")
+
+part3_s_eval <- ggplot(evals %>% filter(part==3), aes(x=subgoals, fill=GS))  + 
+  geom_bar(width=1, position = "dodge", color=GS_scale[2] ) + 
+  ggtitle("Subgoals") +
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  #scale_color_manual(labels = c("ABSENT", "PRESENT"),values =GS_scale) +
+  xlab("Perceived helpfulness") + ylab("Number of responses") + scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) + evaltheme +
+  theme(
+        legend.position = c(0.15,0.9)
+    ) 
+
+ggsave("plots/part3_s_eval.png", part3_s_eval, png(), width=5,height=4,units="cm")
+
+part_s_eval <- ggarrange(part1_s_eval, part3_s_eval, ncol=2, align = "hv")
+part_s_eval <- annotate_figure(part_s_eval,
+               top = text_grob("Perceived Helpfulness of Subgoals", face = "bold", size = 12))
+ggsave("plots/part_s_eval.png", part_s_eval,png(), width=10,height=4,units="cm")
+
+```
+
+## General evaluation
+
+```{r}
+
+eval_long <- evals %>% 
+  rename(Worthwhile = worthwhile, 
+         Enjoyable = enjoyment, 
+         Motivated = motivation, 
+         Effortful = effort, 
+         Concentrated = concent) %>%
+  select(participant, GS,GT, part, Worthwhile, Enjoyable, Motivated, Effortful, Concentrated ) %>%
+  pivot_longer(cols= (Worthwhile:Concentrated), names_to="var") 
+
+############GS
+eval1 <- ggplot(eval_long %>% filter(part==1) , aes(group=GS, fill=GS, x=value )) + 
+  geom_bar(width=1,bins=5, position=position_dodge2()) + 
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) +
+  facet_grid( . ~ var)  +
+  theme(
+    plot.title = element_text(size=10), 
+    legend.position="top"
+    # axis.text.y=element_blank(),
+    #axis.ticks.y=element_blank(),
+    #strip.text.y = element_blank()
+    ) + ggtitle("Part 1 evaluation data")  + xlab("") + ylab("Number of participants")
+
+ggsave("plots/part1_eval.png", eval1,png(), width=15,height=6,units="cm")
+
+eval3 <- ggplot(eval_long %>% filter(part==3) , aes(group=GS, fill=GS, x=value )) + 
+  geom_bar(width=1,bins=5, position=position_dodge2()) + 
+  scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) +
+  facet_grid( . ~ var)  +
+  theme(
+    plot.title = element_text(size=10), 
+    legend.position="top",
+    # axis.text.y=element_blank(),
+    #axis.ticks.y=element_blank(),
+    strip.text.y = element_blank()
+    ) + ggtitle("Part 3 evaluation data") + xlab("") + ylab("Number of participants")
+
+ggsave("plots/part3_eval.png",eval3,png(), width=15,height=6,units="cm")
+
+########### GT
+eval1GT <- ggplot(eval_long %>% filter(part==1) , aes(group=GT, fill=GT, x=value )) + 
+  geom_bar(width=1,bins=5, position=position_dodge2()) + 
+  scale_fill_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_color_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) +
+  facet_grid( . ~ var)  +
+  theme(
+    plot.title = element_text(size=10), 
+    legend.position="top"
+    # axis.text.y=element_blank(),
+    #axis.ticks.y=element_blank(),
+    #strip.text.y = element_blank()
+    ) + ggtitle("Part 1 evaluation data")  + xlab("") + ylab("Number of participants")
+
+ggsave("plots/part1_eval_GT.png", eval1GT, png(), width=15,height=6,units="cm")
+
+eval3GT <- ggplot(eval_long %>% filter(part==3) , aes(group=GT, fill=GT, x=value )) + 
+  geom_bar(width=1,bins=5, position=position_dodge2()) + 
+  scale_fill_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_color_manual(labels = c("¬TG", "TG"),values =GT_scale) +
+  scale_x_continuous( limits = c(0,6), breaks = 1:5, minor_breaks = NULL) +
+  facet_grid( . ~ var)  +
+  theme(
+    plot.title = element_text(size=10), 
+    legend.position="top",
+    # axis.text.y=element_blank(),
+    #axis.ticks.y=element_blank(),
+    strip.text.y = element_blank()
+    ) + ggtitle("Part 3 evaluation data") + xlab("") + ylab("Number of participants")
+
+ggsave("plots/part3_eval_GT.png",eval3GT, png(), width=15,height=6,units="cm")
+
+
+evals %>% filter(part==1, !is.na(thumbnailGraphics)) %>% distinct(participant)
+
+#ggsave("plots/part1_eval.png",last_plot(),png(), width=7,height=15,units="cm")
+
+#ggplot(eval_long %>% filter(part==3) , aes(group=GS, fill=GS, x=value )) + geom_histogram( ) + facet_grid( var ~ GS)
+#ggsave("plots/part3_eval.png",last_plot(),png(), width=7,height=15,units="cm")
+
+```
+
+## Subgoal scoring
+
+```{r}
+subgoalscores <- as_tibble(read.csv('wrangled_data/subgoalscores.csv')) %>% mutate(score = as.character(score))
+
+subgoalscores %>% distinct(qid) %>% nrow()
+
+
+subgoalscores$score[is.na(subgoalscores$score)] <- "NA"
+ggplot( subgoalscores, aes(x=score))  + 
+  geom_bar(width=1, alpha=0.5, color=GS_scale[2] )
+
+table(subgoalscores$score)
+869 / 935
+```
+
+# Demographics
+
+```{r}
+sessions <- as_tibble(read.csv("wrangled_data/sessions.csv")) #%>% select(participant, pretest_score)
+demos1 <- as_tibble(read.csv("wrangled_data/demos.csv")) 
+pretests <- as_tibble(read.csv("wrangled_data/pretests.csv")) 
+
+
+demos <- demos1%>% 
+  inner_join(conditions, by="participant") %>%
+  distinct(participant, .keep_all = T) 
+
+pretest_scores <- pretests %>%
+  distinct(participant, .keep_all = T) %>%
+  pivot_longer( cols= data_types:multiline, names_to="item", values_to="score" ) %>%
+  mutate(score = ifelse(score=='true',1,0))
+
+pretest_score_total <- pretest_scores %>%
+  group_by(participant) %>%
+  summarise(total_score = sum(score))
+
+demos$python[demos$python==0] <- 1
+demos$r[demos$r==0] <- 1
+demos$excel[demos$excel==0] <- 1
+demos$english[demos$english==0] <- 1
+
+### Pre     %>% inner_join(part3_cases, by="participant") 
+
+# Demos of those who completed the entire Part1 set
+part1$demos <- demos %>% 
+  inner_join(select(part1$complete_cases, participant), by="participant")  
+
+part3$demos <- demos %>% 
+  inner_join(select(part3$complete_cases, participant), by="participant") 
+```
+
+```{r, GS}
+part1$gender_GS <- part1$demos %>% 
+  group_by(gender, GS) %>%
+  summarise(n=n()/ nrow(.))
+
+part3$gender_GS <- part3$demos %>% 
+  group_by(gender, GS) %>%
+  summarise(n=n()/ nrow(.))
+
+part1$degree_GS <- part1$demos %>% 
+  mutate( degree= fct_collapse(as.factor(degree), Other=c("Statistics","Medicine","Mathematics","Earth","Psychology","Physics","Humanities","Other")) ) %>%
+  group_by(degree, GS) %>% 
+  summarise(n=n()/nrow(.)) %>% mutate(variable="Degree") 
+
+part3$degree_GS <- part3$demos %>% 
+  mutate( degree= fct_collapse(as.factor(degree), Other=c("Statistics","Medicine","Mathematics","Earth","Psychology","Physics","Humanities","Other")) ) %>%
+  group_by(degree, GS) %>% 
+  summarise(n=n()/nrow(.)) %>% mutate(variable="Degree")  
+
+part1$reason_GS <- part1$demos %>%
+  mutate( reason = fct_collapse(as.factor(reason), Other=c("ebook","Other","research")) ) %>%
+  group_by(reason, GS) %>% 
+  summarise(n=n()/nrow(.)) 
+
+part3$reason_GS <- part3$demos %>%
+  mutate( reason = fct_collapse(as.factor(reason), Other=c("ebook","Other","research")) ) %>%
+  group_by(reason, GS) %>% 
+  summarise(n=n()/nrow(.))
+
+part1$experience_GS <- part1$demos %>%
+  select(participant, GS, python, r, excel) %>%
+  mutate( Experience = python + r + excel ) 
+
+part3$experience_GS <- part3$demos %>%
+  select(participant, GS, python, r, excel) %>%
+  mutate( Experience = python + r + excel ) 
+
+
+participants_3 %>% group_by(reason) %>% summarise(n=n()/nrow(.))
+```
+
+```{r}
+
+### General
+part1$gender <- part1$demos %>% 
+  group_by( gender ) %>%
+  summarise(n=n()/ nrow(.))
+
+part3$gender <- part3$demos %>% 
+  group_by( gender ) %>%
+  summarise(n=n()/ nrow(.))
+
+part1$gender_GT <- part1$demos %>% 
+  group_by(gender, GT) %>%
+  summarise(n=n()/ nrow(.))
+
+part3$gender_GT <- part3$demos %>% 
+  group_by(gender, GT) %>%
+  summarise(n=n()/ nrow(.))
+
+### 
+
+part1$degree <- part1$demos %>% 
+  mutate( degree= fct_collapse(as.factor(degree), Other=c("Statistics","Medicine","Mathematics","Earth","Psychology","Physics","Humanities","Other")) ) %>%
+  group_by(degree ) %>% 
+  summarise(n=n()/nrow(.)) %>% mutate(variable="Degree") 
+
+part3$degree <- part3$demos %>% 
+  mutate( degree= fct_collapse(as.factor(degree), Other=c("Statistics","Medicine","Mathematics","Earth","Psychology","Physics","Humanities","Other")) ) %>%
+  group_by(degree ) %>% 
+  summarise(n=n()/nrow(.)) %>% mutate(variable="Degree") 
+
+part1$degree_GT <- part1$demos %>% 
+  mutate( degree= fct_collapse(as.factor(degree), Other=c("Statistics","Medicine","Mathematics","Earth","Psychology","Physics","Humanities","Other")) ) %>%
+  group_by(degree, GT) %>% 
+  summarise(n=n()/nrow(.)) %>% mutate(variable="Degree") 
+
+part3$degree_GT <- part3$demos %>% 
+  mutate( degree= fct_collapse(as.factor(degree), Other=c("Statistics","Medicine","Mathematics","Earth","Psychology","Physics","Humanities","Other")) ) %>%
+  group_by(degree, GT) %>% 
+  summarise(n=n()/nrow(.)) %>% mutate(variable="Degree")  
+
+###############
+
+part1$reason_GT <- part1$demos %>%
+  mutate( reason = fct_collapse(as.factor(reason), Other=c("ebook","Other","research")) ) %>%
+  group_by(reason, GT) %>% 
+  summarise(n=n()/nrow(.)) 
+
+part3$reason_GT <- part3$demos %>%
+  mutate( reason = fct_collapse(as.factor(reason), Other=c("ebook","Other","research")) ) %>%
+  group_by(reason, GT) %>% 
+  summarise(n=n()/nrow(.))
+```
+
+```{r}
+
+part1$major_pre <- part1$exercise_per_participant %>% 
+  inner_join(demos) %>%
+  select( participant, degree ) %>%
+  mutate(when="pre", part=1)
+
+part1$major_post <- part1$demos %>% 
+  select( participant, degree ) %>%
+  mutate(when="post", part=1)
+
+
+part3$major_pre <- part3$exercise_per_participant %>% 
+  inner_join(demos) %>%
+  select( participant, degree ) %>%
+  mutate(when="pre", part=3)
+
+part3$major_post <- part3$demos %>% 
+  select( participant, degree ) %>%
+  mutate(when="post", part=3)
+
+part1$major_prepost <- bind_rows( part1$major_pre, part1$major_post) %>%
+  pivot_longer(cols = degree, names_to="variable", values_to="value") %>%
+  mutate(when = fct_relevel(when, "pre","post")) %>%
+  mutate(when = recode(when, pre="Started",post="Completed"))
+
+
+part3$major_prepost <- bind_rows( part3$major_pre, part3$major_post) %>%
+  pivot_longer(cols= degree, names_to="variable", values_to="value") %>%
+  mutate(when = fct_relevel(when, "pre","post")) %>%
+  mutate(when = recode(when, pre="Started",post="Completed"))
+
+
+ggplot( part1$major_prepost %>% filter(part==1), aes(x=value, group=when, fill=when ) ) + 
+  geom_bar(width=0.8, position = position_dodge() ) +
+  xlab("Degree") +
+  ylab("Number of participants") +
+  scale_fill_manual(values=c("#999999", accentblue) ) +
+  theme(
+    plot.title = element_text(size=16),
+    legend.position = c(0.5,0.9),
+    legend.direction = "vertical",
+    legend.text = element_text(size=14),
+    axis.title = element_text(size=14),
+    axis.text = element_text(size=12),
+    axis.text.x = element_text(angle=35, size=10, vjust = 1, hjust = 1),
+    strip.text = element_text(size=12),
+    strip.text.y.right = element_text(angle = 0)
+  ) +
+  ggtitle("Part 1 degree programme")
+ggsave("plots/degree_1.png",last_plot(),png(), width=12,height=8,units="cm")
+```
+
+
+```{r, pretest_experience }
+
+
+part1$pretest_pre <- part1$exercise_per_participant %>% 
+  inner_join(pretest_score_total) %>%
+  select( participant, total_score ) %>%
+  mutate(when="pre", part=1)
+
+part1$pretest_post <- part1$demos %>% 
+  inner_join(pretest_score_total) %>%
+  select( participant, total_score ) %>%
+  mutate(when="post", part=1)
+
+part3$pretest_pre <- part3$exercise_per_participant %>% 
+  inner_join(pretest_score_total) %>%
+  select( participant, total_score ) %>%
+  mutate(when="pre", part=3)
+
+part3$pretest_post <- part3$demos %>% 
+  inner_join(pretest_score_total) %>%
+  select( participant, total_score ) %>%
+  mutate(when="post", part=3)
+
+
+part1$pretest_prepost <- bind_rows( part1$pretest_pre, part1$pretest_post) %>%
+  pivot_longer(cols = total_score, names_to="variable", values_to="value") %>%
+  mutate(when = fct_relevel(when, "pre","post")) %>%
+  mutate(when = recode(when, pre="Started",post="Completed"))
+
+
+part3$pretest_prepost <- bind_rows( part3$pretest_pre, part3$pretest_post) %>%
+  pivot_longer(cols= total_score, names_to="variable", values_to="value") %>%
+  mutate(when = fct_relevel(when, "pre","post")) %>%
+  mutate(when = recode(when, pre="Started",post="Completed"))
+
+ggplot( part1$pretest_prepost %>% filter(part==1), aes(x=value, group=when, fill=when ) ) + 
+  geom_bar(width=0.8, position = position_dodge() ) +
+  xlab("Pretest score") +
+  ylab("Number of participants") +
+  scale_fill_manual(values=c("#999999", accentblue) ) +
+  scale_x_discrete( limits=0:8) +
+  theme(
+    plot.title = element_text(size=20),
+    legend.position = "top",
+    legend.direction = "vertical",
+    legend.text = element_text(size=16),
+    axis.title = element_text(size=18),
+    axis.text = element_text(size=18),
+    strip.text = element_text(size=12),
+    strip.text.y.right = element_text(angle = 0)
+  ) +
+  ggtitle("Part 1 pretest scores")
+
+ggsave("plots/prescore_1.png",last_plot(),png(), width=12,height=6,units="cm")
+
+```
+
+```{r, prepost_experience }
+
+part1$experience_pre <- part1$exercise_per_participant %>% 
+  inner_join(demos) %>%
+  select(participant, python, r, excel) %>%
+  mutate(when="pre", part=1)
+
+part1$experience_post <- part1$demos %>%
+  select(participant, python, r, excel) %>%
+  mutate(when="post", part=1)
+
+part1$experience_prepost <- bind_rows( part1$experience_pre, part1$experience_post) %>%
+  pivot_longer(cols=python:excel, names_to="variable", values_to="value") %>%
+  mutate(when = fct_relevel(when, "pre","post")) %>%
+  mutate(variable = recode(variable, python="Python",r="R", excel="Excel")) %>%
+  mutate(when = recode(when, pre="Started",post="Completed"))
+
+ggplot( part1$experience_prepost, aes(x=value, group=when, fill=when ) ) + 
+  geom_bar(width=0.8, position = position_dodge() ) +
+  facet_wrap( . ~ variable) +
+  xlab("Self-reported experience") +
+  ylab("Number of participants") +
+  scale_fill_manual(values=c("#999999", accentblue) ) +
+  ggtitle("Part 1")
+
+ggsave("plots/experience1.png",last_plot(),png(), width=10,height=5,units="cm")
+
+###
+part3$experience_pre <- part3$exercise_per_participant %>% 
+  inner_join(demos) %>%
+  select(participant, python, r, excel)  %>%
+  mutate(when="pre", part=3)
+
+part3$experience_post <- part3$demos %>%
+  select(participant, python, r, excel) %>%
+  mutate(when="post", part=3)
+
+
+#part3$
+
+experience_prepost <- bind_rows(
+  part1$experience_pre, part1$experience_post, part3$experience_pre, part3$experience_post) %>%
+  pivot_longer(cols=python:excel, names_to="variable", values_to="value") %>%
+  mutate(when = fct_relevel(when, "pre","post")) %>%
+  mutate(variable = recode(variable, python="Python",r="R", excel="Excel")) %>%
+  mutate(part = recode( factor(part) , `1`="Part 1", `3`="Part 3")) %>%
+  mutate(when = recode(when, pre="Started",post="Completed"))
+
+
+
+
+ggplot( experience_prepost %>% filter(part=="Part 1"), aes(x=value, group=when, fill=when ) ) + 
+  geom_bar(width=0.8, position = position_dodge() ) +
+  facet_wrap( . ~ variable) +
+  xlab("Self-reported experience") +
+  ylab("Number of participants") +
+  scale_fill_manual(values=c("#999999", accentblue) ) +
+  theme(
+    plot.title = element_text(size=18),
+    legend.position = "top",
+    legend.text = element_text(size=16),
+    axis.title = element_text(size=16),
+    strip.text = element_text(size=16),
+    strip.text.y.right = element_text(angle = 0)
+  ) +
+  ggtitle("Part 1 experience level")
+ggsave("plots/experience_1.png",last_plot(),png(), width=15,height=8,units="cm")
+
+
+
+
+ggplot( experience_prepost %>% filter(part=="Part 3"), aes(x=value, group=when, fill=when ) ) + 
+  geom_bar(width=0.8, position = position_dodge() ) +
+  facet_wrap( . ~ variable) +
+  xlab("Self-reported experience") +
+  ylab("Number of participants") +
+  scale_fill_manual(values=c("#999999", accentblue) ) +
+  theme(
+    plot.title = element_text(size=18),
+    legend.position = "top",
+    legend.text = element_text(size=16),
+    axis.title = element_text(size=16),
+    strip.text = element_text(size=16),
+    strip.text.y.right = element_text(angle = 0)
+  ) +
+  ggtitle("Part 3 experience level")
+
+ggsave("plots/experience_3.png",last_plot(),png(), width=15,height=8,units="cm")
+
+
+
+
+```
+
+```{r}
+
+group3 <- part3$complete_cases %>% 
+  inner_join(
+    demos1 %>% 
+     select(participant,group) %>%
+      distinct(participant, group)
+  ) %>% 
+  select(participant, group) %>%
+  group_by(group) %>%
+  summarise(n=n()) %>% mutate(percent = n/ sum( n ) )
+
+
+group1 <- part1$complete_cases %>% 
+  inner_join(
+    demos1 %>% 
+     select(participant,group) %>%
+      distinct(participant, group)
+  ) %>% 
+  select(participant, group) %>%
+  group_by(group) %>%
+  summarise(n=n()) %>% mutate(percent = n/ sum( n ) )
+
+
+```
+
+
+
+```{r}
+
+gender1plot <- ggplot(part1$gender_GT , aes(y=n, x=GT, fill=gender)) + 
+  geom_bar(position="fill", stat="identity", width=0.5, size=1) + 
+  coord_flip() + scale_x_discrete(labels=c("¬SG","SG")) +
+  scale_fill_brewer(palette = "Oranges", labels=c("Female","Male")) + xlab("") + ggtitle("Gender") +
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        plot.title = element_text(size=7),
+        legend.text=element_text(size=4),
+        legend.position="none",
+      #  legend.position="bottom",
+       # legend.direction = "vertical",
+          #legend.text=element_text(size=4),
+        legend.key.size = unit(0.2, "cm"),
+        axis.text.y=element_text(size=4)
+        #legend.position="bottom"
+        )
+
+ggsave("plots/gender1.png",last_plot(),png(), width=4,height=2,units="cm")
+
+gender3plot <- ggplot( part3$gender_GT  %>% filter(gender !="prefernot"), aes(y=n, x=GT, fill=gender)) + 
+  geom_bar(position="fill", stat="identity", width=0.5, size=1) + 
+  coord_flip() + scale_x_discrete(labels=c("¬TG","TG")) +
+  scale_fill_brewer(palette = "Oranges", labels=c("Female","Male")) + xlab("") + ggtitle("Gender") +
+    theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        plot.title = element_text(size=7),
+        legend.text=element_text(size=4),
+        #legend.position="none",
+        legend.position="bottom",
+       # legend.direction = "vertical",
+          #legend.text=element_text(size=4),
+        legend.key.size = unit(0.2, "cm"),
+        axis.text.y=element_text(size=4)
+        #legend.position="bottom"
+        )
+
+ggsave("plots/gender3.png",last_plot(),png(), width=4,height=2,units="cm")
+```
+
+
+```{r}
+
+#participants_1_3 %>% 
+#  group_by(degree) %>% 
+#  summarise(n=n()) %>% mutate(variable="Degree") %>%
+#  arrange(desc(n))
+
+
+degreeplot1 <- ggplot(degree_df1, aes(y=n, x=GS, fill=reorder(degree, n))) + 
+  geom_bar(position="fill", stat="identity", width=0.5, size=1) + 
+  coord_flip() + scale_x_discrete(labels=c("¬SG","SG")) +
+  scale_fill_brewer(palette = "Oranges") + xlab("") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=4),
+        axis.ticks.x=element_blank(),
+        legend.position = "none",
+        #legend.position="bottom",
+        #legend.direction = "vertical",
+        plot.title = element_text(size=7),
+          legend.text=element_text(size=4),
+        legend.key.size = unit(0.2, "cm")
+                #legend.position="bottom"
+        ) + ggtitle("Degree")
+
+ggsave("plots/degree1.png",last_plot(),png(), width=4,height=2,units="cm")
+
+degreeplot3 <- ggplot(degree_df3, aes(y=n, x=GS, fill=reorder(degree, n))) + 
+  geom_bar(position="fill", stat="identity", width=0.5, size=1) + 
+  coord_flip() + scale_x_discrete(labels=c("¬SG","SG")) +
+  scale_fill_brewer(palette = "Oranges") + xlab("") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.text.y=element_text(size=4),
+        axis.ticks.x=element_blank(),
+        legend.position = "none",
+        #legend.position="bottom",
+        #legend.direction = "vertical",
+        plot.title = element_text(size=7),
+          legend.text=element_text(size=4),
+        legend.key.size = unit(0.2, "cm")
+                #legend.position="bottom"
+        ) + ggtitle("Degree")
+
+ggsave("plots/degree3.png",last_plot(),png(), width=4,height=2,units="cm")
+
+```
+
+```{r}
+reasonplot1 <- ggplot(reason_df1, aes(y=n, x=GS, fill=reorder(reason, n))) + 
+  geom_bar(position="fill", stat="identity", width=0.5, size=1) + 
+  coord_flip() + scale_x_discrete(labels=c("¬SG","SG")) +
+  scale_fill_brewer(palette = "Oranges", labels=c("Personal project","Other","Job search" ,"Curiosity", "Coursework" )) + xlab("") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        legend.position = "none",
+        #legend.position="bottom",
+        #legend.direction = "vertical",
+       plot.title = element_text(size=7),
+       legend.text=element_text(size=4),
+       legend.key.size = unit(0.2, "cm"),
+       axis.text.y=element_text(size=4),
+        axis.ticks.x=element_blank()) + ggtitle("Reason for participating") #+ theme_void()
+
+ggsave("plots/reason1.png",last_plot(),png(), width=4,height=2,units="cm")
+
+reasonplot3 <- ggplot(reason_df3, aes(y=n, x=GS, fill=reorder(reason, n))) + 
+  geom_bar(position="fill", stat="identity", width=0.5, size=1) + 
+  coord_flip() + scale_x_discrete(labels=c("¬SG","SG")) +
+  scale_fill_brewer(palette = "Oranges", labels=c("Personal project","Other","Job search" ,"Curiosity", "Coursework" )) + xlab("") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        legend.position = "none",
+        #legend.position="bottom",
+        #legend.direction = "vertical",
+       plot.title = element_text(size=7),
+       legend.text=element_text(size=4),
+       legend.key.size = unit(0.2, "cm"),
+       axis.text.y=element_text(size=4),
+        axis.ticks.x=element_blank()) + ggtitle("Reason for participating") #+ theme_void()
+
+ggsave("plots/reason3.png",last_plot(),png(), width=4,height=2,units="cm")
+```
+
+```{r}
+
+labels <- c(`True`="SG", `False`="¬SG")
+
+experienceplot1 <- ggplot(part1$experience_GS %>% mutate(GS=fct_relevel(as.factor(GS), "True", "False")) , aes(x=Experience, fill=GS)) + 
+      geom_bar() + 
+      facet_grid( GS ~ . , labeller = as_labeller(labels),switch="both") +
+      ylab("") + xlab("") +
+      scale_fill_manual(labels = c("SG", "¬SG"),values =rev(GS_scale))  + 
+      ggtitle("Started") +
+      theme(
+        strip.background = element_blank(),
+        legend.position="none",
+        strip.text.y.left = element_text(angle = 0,size=5),
+        plot.title = element_text(size=7),
+        axis.text.y = element_text(size=8),
+        #legend.text=element_text(size=3),
+        axis.text.x = element_text(size=8)
+      ) 
+
+
+experienceplot3 <- ggplot(experience_df3 %>% mutate(GS=fct_relevel(as.factor(GS), "True", "False")) , aes(x=Experience, fill=GS)) + 
+      geom_bar() + 
+      facet_grid( GS ~ . , labeller = as_labeller(labels),switch="both") +
+      ylab("") + xlab("") +
+      scale_fill_manual(labels = c("SG", "¬SG"),values =rev(GS_scale))  + 
+      ggtitle("Completed") +
+      theme(
+        strip.background = element_blank(),
+        legend.position="none",
+        strip.text.y.left = element_text(angle = 0,size=5),
+        plot.title = element_text(size=7),
+        axis.text.y = element_text(size=8),
+        #legend.text=element_text(size=3),
+        axis.text.x = element_text(size=8)
+      ) 
+
+plot_exp <- ggarrange(experienceplot1, experienceplot3, ncol=2, align = "hv")
+plot_exp <- annotate_figure(plot_exp,
+               top = text_grob("Prior experience", face = "bold", size = 10))
+ggsave("plots/experience.png",last_plot(),png(), width=8,height=5,units="cm")
+
+#ggarrange(
+#genderplot, degreeplot, reasonplot, experienceplot, nrow=1
+#)
+#ggsave("plots/demographic.png",last_plot(),png(), width=12,height=5,units="cm")
+```
+# Language choice
+
+```{r}
+
+lang_sess <- sessions %>% inner_join(part3$complete_cases, by="participant") %>% select(language)
+lang_sess %>% table()
+```
+```{r}
+setdiff( part3_complete_cases %>% select(participant), part1_complete_cases %>% select(participant))
+
+```
+
+# Effect of prior expertise
+
+```{r}
+expertise_tot3 <- sbj_lvl_tot3 %>% inner_join(demos %>% select(participant, python))
+
+expertise_attempts3 <- sbj_lvl_attempts3 %>% inner_join(demos %>% select(participant, python))  
+
+expertise_tot1 <- sbj_lvl_tot1 %>% inner_join(demos %>% select(participant, python))
+
+expertise_attempts1 <- sbj_lvl_attempts1 %>% inner_join(demos %>% select(participant, python))  
+
+
+attempts1<- ggplot( expertise_attempts1, aes(x=as.factor(python), y=total_attempts, color=GS, fill=GS)  ) + 
+  geom_boxplot(  alpha=0.6) +
+  geom_point(aes(group=GS), size=3, alpha=0.1, position = position_dodge(0.8) ) +
+    scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+      scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  coord_flip() + xlab("Python experience") + ylab("Total number of attempts") + ggtitle("Part 1 Number of Attempts") +
+    theme(
+        legend.position=c(1,0.7),
+        #legend.direction="horizontal",
+        legend.justification=c(1, 0),
+            plot.title = element_text(size=10), 
+                axis.title.x=element_text(size=8), 
+     axis.title.y=element_blank()
+  )
+
+tot1 <- ggplot( expertise_tot1, aes(x=as.factor(python), y=total_time, color=GS, fill=GS)  ) + 
+  geom_boxplot(  alpha=0.6) +
+  geom_point(aes(group=GS), size=3, alpha=0.1, position = position_dodge(0.8) ) +
+    scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+      scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  coord_flip() + xlab("Python experience") + ylab("Total time (seconds)") + ggtitle("Part 1 Time On Task") +
+    theme(
+        legend.position=c(1,0.7),
+        #legend.direction="horizontal",
+        legend.justification=c(1, 0),
+            plot.title = element_text(size=10), 
+        axis.title.x=element_text(size=8), 
+     axis.title.y=element_blank()
+  )
+
+
+attempts3<- ggplot( expertise_attempts3, aes(x=as.factor(python), y=nr_attempts, color=GS, fill=GS)  ) + 
+  geom_boxplot(  alpha=0.6) +
+  geom_point(aes(group=GS), size=3, alpha=0.1, position = position_dodge(0.8) ) +
+    scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+      scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  coord_flip() + xlab("Python experience") + ylab("Total number of attempts") + ggtitle("Part 3 Number of Attempts") +
+    theme(
+        legend.position=c(1,0.7),
+        #legend.direction="horizontal",
+        legend.justification=c(1, 0),
+            plot.title = element_text(size=10), 
+                axis.title.x=element_text(size=8), 
+     axis.title.y=element_blank()
+  )
+
+tot3 <- ggplot( expertise_tot3, aes(x=as.factor(python), y=total_time, color=GS, fill=GS)  ) + 
+  geom_boxplot(  alpha=0.6) +
+  geom_point(aes(group=GS), size=3, alpha=0.1, position = position_dodge(0.8) ) +
+    scale_fill_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+      scale_color_manual(labels = c("¬SG", "SG"),values =GS_scale) +
+  coord_flip() + xlab("Python experience") + ylab("Total time (seconds)") + ggtitle("Part 3 Time On Task") +
+    theme(
+        legend.position=c(1,0.7),
+        #legend.direction="horizontal",
+        legend.justification=c(1, 0),
+            plot.title = element_text(size=10), 
+                axis.title.x=element_text(size=8), 
+     axis.title.y=element_blank()
+    # axis.ticks.y=element_blank(),
+        
+  )
+
+expert <- ggarrange(attempts1, tot1, attempts3, tot3, ncol=2, nrow=2, align = "hv")
+expert <- annotate_figure(expert,
+               top = text_grob("Experience in relation to performance", face = "bold", size = 12),
+               left = text_grob("Python experience", face = "bold", size = 12, rot=90))
+expert
+
+ggsave("plots/expert.png", expert,png(), width=16,height=12,units="cm")
+
+#expertise_attempts %>% filter(python ==2, GS=="False") %>% select(participant,nr_attempts)
+
+```
+
+```{r}
+ggplot( expertise_tot, aes(x=python, y=total_time, color=GS)  ) + geom_point()
+
+```
+
+
+```{r, provenance}
+demos %>% 
+  group_by(group) %>%
+  summarise(percent = (100 * n( ))/nrow(.))
+
+```
+
+
+# Part 3 Master frame
+
+```{r}
+### Part 3
+master.part3.participant <- part3$complete_cases %>% mutate(nr_exercises = n) %>% select(participant, nr_exercises) %>%
+  inner_join( part3$taxclicks_per_participant_withzero %>% select(participant, nr_clicks) ) %>% #Total_time
+  inner_join( part3$logs_wide  %>% select(participant, tab, timeout) ) %>% #logs%
+  inner_join( part3$tot_per_participant %>% select(participant,total_time ) ) %>%
+  inner_join( part3$semantic_per_participant %>% select(participant, nr_sem)  ) %>% #semantic
+  inner_join( part3$errors_per_participant %>% select(participant, nr_errors) ) %>% #errors
+  inner_join( part3$hintdata  %>% select(participant, nr_hints) ) %>% #hints
+  inner_join( part3$hover_per_participant_nonzero %>% select(participant, nr_hovers)  ) %>% 
+  inner_join( demos1 %>% group_by(participant) %>% arrange(timestamp) %>% slice(1) %>% ungroup , by="participant") %>% #demos
+  inner_join( languages ) %>%
+  inner_join( conditions, by="participant"  ) %>%
+  left_join( evals1 %>% filter(part==3) %>% distinct(participant, .keep_all=T), by="participant") %>% 
+  select(-c("timestamp.x", "X.y","X.x")) 
+
+write.csv(master.part3.participant, "master_part3_participant.csv")
+
+### Part 1
+master.part1.participant <- part1$complete_cases %>% mutate(nr_exercises = n) %>% select(participant, nr_exercises) %>%
+  inner_join( part1$taxclicks_per_participant_nonzero %>% select(participant, nr_clicks) ) %>% #Total_time
+  inner_join( part1$logs_wide  %>% select(participant, tab, timeout) ) %>% #logs
+  inner_join( part1$attempts_per_participant %>% select(participant, total_attempts)  ) %>% #semantic
+  inner_join( part1$tot_per_participant %>% select(participant,total_time ) ) %>%
+  inner_join( part1$hovers_per_participant %>% select(participant, nr_hovers)  ) %>%  
+  inner_join( part1$opdurations_durations ) %>%
+  inner_join( demos1 %>% group_by(participant) %>% arrange(timestamp) %>% slice(1) %>% ungroup , by="participant") %>% #demos
+  inner_join( languages ) %>%
+  inner_join( conditions, by="participant"  ) %>%
+  left_join( evals1 %>% filter(part==1  ) %>% distinct(participant, .keep_all=T), by="participant") %>% 
+  select(-c("timestamp.x", "X.y","X.x")) 
+
+write.csv(master.part1.participant, "master_part1_participant.csv")
+
+```
+
+# Part trial level
+
+```{r}
+
+### Part 1
+
+part1$taxclicks_per_exercise_participant <- clickevents %>% filter(part==1, type=="TAXONOMY") %>% 
+  group_by(participant, qid ) %>% summarise(nr_clicks=n())
+
+part1$hovers_per_exercise_participant <- clickevents %>% filter(part==1, type=="thumbnail-hover") %>% 
+  group_by(participant, qid ) %>% summarise(nr_hovers=n())
+
+part1$drag_per_exercise_participant <- dragdropstates %>% filter(correct=='True') %>% 
+  group_by(participant, qid ) %>% summarise(nr_attempts=n())
+
+master.part1.exercises <- part1$exercises_all %>% 
+  mutate( startTime=as_datetime(startTime), endTime=as_datetime(endTime)) %>%
+  select(participant, qid, startTime, endTime, duration, GT, GS) %>%
+  left_join( part1$taxclicks_per_exercise_participant  ) %>%
+  left_join( part1$hovers_per_exercise_participant  ) %>%
+  left_join( part1$drag_per_exercise_participant  )
+
+write.csv(master.part1.exercises, "master_part1_exercises.csv")
+
+### Part 3
+
+part3$taxclicks_per_exercise_participant <- clickevents %>% filter(part==3, type=="TAXONOMY") %>% 
+  group_by(participant, qid ) %>% summarise(nr_clicks=n())
+
+part3$hovers_per_exercise_participant <- clickevents %>% filter(part==3, type=="thumbnail-hover") %>% 
+  group_by(participant, qid ) %>% summarise(nr_hovers=n())
+
+part3$semantic_per_exercise_participant <- part3$progexruns %>% filter(qid %in% part3$qids, type %in% c('output','result','sct')) %>% 
+  group_by(participant, qid ) %>% summarise(nr_semantics=n())
+
+part3$errors_per_exercise_participant <- part3$progexruns %>% filter(qid %in% part3$qids, str_detect(type, 'error')) %>% 
+  group_by(participant, qid ) %>% summarise(nr_errors=n())
+
+part3$hints_per_exercise_participant <- clickevents %>% filter(part==3, type=="HINT") %>% group_by(participant, qid ) %>% summarise(nr_hints=n())
+
+master.part3.exercises <- part3$exercises %>% 
+  mutate( startTime=as_datetime(startTime), endTime=as_datetime(endTime)) %>%
+  select(participant, qid, startTime, endTime, duration, GT, GS) %>%
+  left_join( part3$taxclicks_per_exercise_participant  ) %>%
+  left_join( part3$hovers_per_exercise_participant  ) %>%
+  left_join( part3$semantic_per_exercise_participant  ) %>%
+  left_join( part3$errors_per_exercise_participant ) %>%
+  left_join( part3$hints_per_exercise_participant )
+
+write.csv(master.part3.exercises, "master_part3_exercises.csv")
+
+
+```
+# Transition matrix
+
+```{r}
+
+editevents <- as_tibble(read.csv("wrangled_data/editevents.csv"))
+
+# 1. Collect all events
+
+clicksevs <- clickevents %>% rename(code="type") %>% mutate(timestamp = as_datetime(timestamp)) %>% filter(qid %in% part3$qids)  %>% select(-X, -part,-data, -qid)
+
+editevs <- editevents %>% mutate(timestamp = as_datetime(timestamp), code=paste("coding_",code,sep=""))  %>% filter(qid %in% part3$qids) %>% select(-X, -qid)
+
+part3$starting_times_all <- part3$exercises %>%
+  mutate(startTime=as_datetime(startTime)) %>%
+  filter(qid == "vector1") %>%
+  group_by(participant) %>%
+  arrange(startTime) %>%
+  slice(1) %>%
+  rename(startingTime = startTime) %>%
+  select(participant, startingTime)
+
+logevs <- logevents %>% 
+  filter(startorend != "end") %>% 
+  mutate(code=category) %>%
+  select(-X, -X_id, -category, -startorend) %>%
+  mutate(timestamp = as_datetime(timestamp)) %>%
+  inner_join(part3$starting_times_all, by="participant") %>%
+  filter(timestamp > startingTime) %>% select(-startingTime)
+  
+#%>%
+#  mutate(timestamp = as_datetime(timestamp), code=paste(category, startorend, sep="_"))  
+
+progexevs <- part3$progexruns %>% 
+  mutate(timestamp = as_datetime(timestamp), code = case_when(
+    type == "sct" ~ "click_submit",
+    type == "result" ~ "click_run",
+    type == "output"~ "receive_output",
+    str_detect(type,"error") ~ "receive_error",
+    T ~ "receive_output"
+    )) %>% 
+  select(participant, timestamp, code)
+```
+
+```{r}
+events <- bind_rows(clicksevs, editevs, logevs, progexevs)
+
+event.frame <- events %>%
+  group_by(participant) %>%
+  #arrange(timestamp) %>%
+  mutate(next_code = lead(code,order_by =timestamp), previous_code= lag(code,order_by =timestamp))
+
+write.csv(event.frame, "eventframe.csv")
+
+event.normal <- event.frame %>% 
+  filter(!is.na(code), !is.na(next_code)) %>% 
+  group_by(code, next_code) %>% 
+  summarise(n=n()) %>% 
+  mutate(freq = n / sum(n), txt=paste(n,sum(n),sep="_"))
+```
+
+```{r}
+
+coarse.frame <- events %>%
+  filter(code != "log", !str_detect(code, "receive")) %>% #Remove logins and logouts
+  mutate(code = case_when(
+      code == "CLICKEVENT"       ~ "Exercise",
+      code == "SUBGOAL"          ~ "Subgoal",
+      code == "HINT"             ~ "Hint",
+      str_detect(code, "coding") ~ "Code",
+      str_detect(code,"click_")  ~ "Test",
+      code %in% c("DOCUMENTATION", "COPYEVENT", "TAXONOMY", "thumbnail-hover") ~ "Lookup",
+      code %in% c("tab","timeout") ~ "TabOrTimeout",
+      TRUE                      ~ "other"
+    )
+  ) %>%
+  mutate(next_code = lead(code,order_by =timestamp), previous_code= lag(code,order_by =timestamp))  
+
+coarse.normal <- coarse.frame %>% 
+  filter(!is.na(code), !is.na(next_code)) %>% 
+  group_by(code, next_code) %>% 
+  summarise(n=n()) %>% 
+  mutate(n = ifelse(code==next_code, NA, n)) %>%
+  mutate(freq = n / sum(n, na.rm = T)) #, txt=paste(n,sum(n, na.rm = T),sep="_"))
+
+
+coarse.map <- ggplot(coarse.normal, aes(y=code, x=next_code, fill= freq)) + 
+  geom_tile() +
+  scale_fill_gradient(low="white", high= accentblue  ) +
+  theme(
+    axis.text.x = element_text(angle = 90),
+    axis.text = element_text(size=18)
+  )
+
+#### What do people do when they get an error?
+
+```
+
+```{r}
+
+```
